@@ -106,6 +106,7 @@ import extend_distributed as ext_dist
 
 import os
 import psutil
+import RobezEmbeddingCPU
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
@@ -214,6 +215,12 @@ class DLRM_Net(nn.Module):
         return torch.nn.Sequential(*layers)
 
     def create_emb(self, m, ln, local_ln_emb=None, np_init_emb_weight=False):
+        self.hashed_weight = None
+        if self.is_rma:
+              self.hashed_weight = nn.Parameter(torch.from_numpy(np.random.uniform(
+                                        low=-np.sqrt(1 / max(ln)), high=np.sqrt(1 / max(ln)), size=((self.rma_size,))
+                                        ).astype(np.float32)))
+
         total_numel = 0
         for n in ln:
             total_numel += m * n
@@ -222,6 +229,8 @@ class DLRM_Net(nn.Module):
         print("current mem usage: {} G".format(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024 / 1024))
         emb_l = nn.ModuleList()
         n_embs = ln.size if local_ln_emb is None else len(local_ln_emb)
+
+        val_idx_offset = 0
         for i in range(n_embs):
             if local_ln_emb is None:
                 n = ln[i]
@@ -233,9 +242,13 @@ class DLRM_Net(nn.Module):
                         low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
                     ).astype(np.float32)
                 EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True, _weight=torch.from_numpy(W).requires_grad_())
+            elif self.is_rma:
+                EE = RobezEmbeddingCPU.RobezEmbedding(n, m, self.hashed_weight, val_offset = val_idx_offset, robez_chunk_size=32, sparse=False)
             else:
                 EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
             emb_l.append(EE)
+            val_idx_offset += n
+
         print("create emb done, current mem usage: {} G".format(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024 / 1024))
         self.numel += total_numel
         return emb_l
@@ -250,7 +263,9 @@ class DLRM_Net(nn.Module):
         sigmoid_top=-1,
         weighted_pooling=None,
         loss_threshold=0.0,
-        np_init_emb_weight=False
+        np_init_emb_weight=False,
+        is_rma=False,
+        rma_size=1000000,
     ):
         super(DLRM_Net, self).__init__()
         self.numel = 0
@@ -272,6 +287,8 @@ class DLRM_Net(nn.Module):
         self.emb_l = self.create_emb(m_spa, ln_emb, self.local_ln_emb, np_init_emb_weight)
         self.loss_fn = torch.nn.BCELoss(reduction="mean")
 
+        self.is_rma = is_rma
+        self.rma_size = rma_size
 
     def apply_mlp(self, x, layers):
         # approach 1: use ModuleList
@@ -715,6 +732,9 @@ def run():
     parser.add_argument("--calibration", action="store_true", default=False)
     parser.add_argument("--int8-configure", type=str, default="./int8_configure.json")
     parser.add_argument("--dist-backend", type=str, default="ccl")
+    # robez
+    parser.add_argument("--is-rma", action="store_true", default=False)
+    parser.add_argument("--rma-size", type=int, default=1000000)
 
     global args
     global nbatches
@@ -791,6 +811,8 @@ def run():
         sigmoid_top=ln_top.size - 2,
         loss_threshold=args.loss_threshold,
         np_init_emb_weight=np_init_emb_weight,
+        is_rma=args.is_rma,
+        rma_size=args.rma_size,
     )
 
     if args.ipex_merged_emb:
