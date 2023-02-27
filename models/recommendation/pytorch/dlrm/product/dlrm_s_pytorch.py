@@ -237,13 +237,14 @@ class DLRM_Net(nn.Module):
             else:
                 n = ln[local_ln_emb[i]]
             print("Create Embedding: {}".format(n), flush=True)
-            if np_init_emb_weight:
+
+            if self.is_rma:
+                EE = RobezEmbeddingCPU.RobezEmbedding(n, m, self.hashed_weight, val_offset = val_idx_offset, robez_chunk_size=32, sparse=False)
+            elif np_init_emb_weight:
                 W = np.random.uniform(
                         low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
                     ).astype(np.float32)
                 EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True, _weight=torch.from_numpy(W).requires_grad_())
-            elif self.is_rma:
-                EE = RobezEmbeddingCPU.RobezEmbedding(n, m, self.hashed_weight, val_offset = val_idx_offset, robez_chunk_size=32, sparse=False)
             else:
                 EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
             emb_l.append(EE)
@@ -268,6 +269,8 @@ class DLRM_Net(nn.Module):
         rma_size=1000000,
     ):
         super(DLRM_Net, self).__init__()
+        self.is_rma = is_rma
+        self.rma_size = rma_size
         self.numel = 0
         self.loss_threshold = loss_threshold
         #If running distributed, get local slice of embedding tables
@@ -287,8 +290,6 @@ class DLRM_Net(nn.Module):
         self.emb_l = self.create_emb(m_spa, ln_emb, self.local_ln_emb, np_init_emb_weight)
         self.loss_fn = torch.nn.BCELoss(reduction="mean")
 
-        self.is_rma = is_rma
-        self.rma_size = rma_size
 
     def apply_mlp(self, x, layers):
         # approach 1: use ModuleList
